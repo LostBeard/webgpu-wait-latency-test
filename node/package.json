@@ -1,0 +1,7 @@
+{
+  "name": "webgpu-wait-latency-node-probe",
+  "private": true,
+  "type": "module",
+  "description": "The webgpu-wait-latency-test cases against Google Dawn directly (npm webgpu), no browser.",
+  "dependencies": { "webgpu": "0.6.2" }
+}

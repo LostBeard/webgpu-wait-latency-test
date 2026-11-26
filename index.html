@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGPU wait latency test</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1b1f24; --bg: #ffffff; --muted: #5a6470; --line: #d5dae0; --accent: #0b6bcb; --warn: #b35900; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e6e9ed; --bg: #14171b; --muted: #9aa4af; --line: #2c333b; --accent: #5aa9ff; --warn: #ffb15a; } }
+  body { font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; padding: 16px; max-width: 980px; margin-inline: auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+  p.lead { color: var(--muted); margin-top: 0; }
+  button { font: inherit; padding: .45rem .9rem; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  table { border-collapse: collapse; width: 100%; margin: .75rem 0; font-variant-numeric: tabular-nums; }
+  th, td { border-bottom: 1px solid var(--line); padding: .35rem .5rem; text-align: left; vertical-align: top; }
+  td.num { text-align: right; white-space: nowrap; }
+  code, pre { font-family: ui-monospace, Consolas, monospace; font-size: .9em; }
+  pre { background: color-mix(in srgb, var(--fg) 6%, transparent); padding: .75rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+  .muted { color: var(--muted); }
+  .warn { color: var(--warn); }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+</style>
+</head>
+<body>
+<h1>WebGPU wait latency test</h1>
+<p class="lead">How long does it take, after a tiny GPU job is submitted, for the page to learn that it finished? Each case below
+submits work that takes the GPU microseconds and waits for it, the way any app reads a result back. The source is this page:
+plain WebGPU, no libraries.</p>
+
+<div class="row">
+  <button id="run">Run the test</button>
+  <button id="copy" class="secondary" disabled>Copy the report</button>
+  <a id="issue" class="muted" href="https://github.com/LostBeard/webgpu-wait-latency-test/issues/new" target="_blank" rel="noopener">Open an issue with your result</a>
+</div>
+<p id="status" class="muted">Takes a few seconds.</p>
+
+<table id="results" hidden>
+  <thead><tr><th>Case</th><th>What is submitted and awaited</th><th class="num">Median (ms)</th><th class="num">Min (ms)</th><th class="num">p90 (ms)</th></tr></thead>
+  <tbody></tbody>
+</table>
+<pre id="report" hidden></pre>
+
+<script type="module">
+const CASES = [
+  ['A_emptyDone',       'onSubmittedWorkDone() with nothing submitted (the round trip alone)'],
+  ['B_dispatchDone',    'a 1,000-thread compute dispatch, then onSubmittedWorkDone()'],
+  ['C_copyDone',        'a 4 KB copyBufferToBuffer, then onSubmittedWorkDone()'],
+  ['D_copyMap',         'a 4 KB copy, then mapAsync(READ) of the destination (what a readback does)'],
+  ['E_doneThenMap',     'a 4 KB copy, onSubmittedWorkDone(), then mapAsync(READ)'],
+  ['F_dispatchCopyMap', 'a dispatch and a 4 KB copy, then mapAsync(READ)'],
+  ['G_emptySubmitDone', 'an empty command buffer submitted, then onSubmittedWorkDone()'],
+];
+const ROUNDS = 2, WARMUP = 5, SAMPLES = 40;
+const $ = id => document.getElementById(id);
+let lastReport = '';
+
+function stats(xs) {
+  const s = [...xs].sort((a, b) => a - b);
+  const q = p => s[Math.min(s.length - 1, Math.floor(p * s.length))];
+  return { median: q(0.5), min: s[0], p90: q(0.9) };
+}
+// the smallest step performance.now() takes here (coarsened to 0.1 ms on pages that are not cross-origin isolated)
+function timerStep() {
+  let best = Infinity, last = performance.now();
+  for (let i = 0; i < 200000 && best > 0.001; i++) { const t = performance.now(); if (t !== last) { best = Math.min(best, t - last); last = t; } }
+  return best;
+}
+
+async function run() {
+  $('run').disabled = true; $('copy').disabled = true;
+  const status = m => $('status').textContent = m;
+  if (!navigator.gpu) { status('This browser has no WebGPU (navigator.gpu is missing).'); $('run').disabled = false; return; }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) { status('No WebGPU adapter.'); $('run').disabled = false; return; }
+  const device = await adapter.requestDevice();
+  const q = device.queue;
+  const N = 1000 * 4;
+  const src = device.createBuffer({ size: N, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  const staging = device.createBuffer({ size: N, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const module = device.createShaderModule({ code: `@group(0) @binding(0) var<storage, read_write> b: array<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) { if (g.x < 1000u) { b[g.x] = b[g.x] + 1.0; } }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: src } }] });
+  const copy = () => { const e = device.createCommandEncoder(); e.copyBufferToBuffer(src, 0, staging, 0, N); q.submit([e.finish()]); };
+  const dispatch = () => { const e = device.createCommandEncoder(); const p = e.beginComputePass(); p.setPipeline(pipeline); p.setBindGroup(0, bindGroup); p.dispatchWorkgroups(16); p.end(); q.submit([e.finish()]); };
+  const map = async () => { await staging.mapAsync(GPUMapMode.READ); staging.getMappedRange(); staging.unmap(); };
+  const fns = {
+    A_emptyDone: async () => { await q.onSubmittedWorkDone(); },
+    B_dispatchDone: async () => { dispatch(); await q.onSubmittedWorkDone(); },
+    C_copyDone: async () => { copy(); await q.onSubmittedWorkDone(); },
+    D_copyMap: async () => { copy(); await map(); },
+    E_doneThenMap: async () => { copy(); await q.onSubmittedWorkDone(); await map(); },
+    F_dispatchCopyMap: async () => { dispatch(); copy(); await map(); },
+    G_emptySubmitDone: async () => { q.submit([device.createCommandEncoder().finish()]); await q.onSubmittedWorkDone(); },
+  };
+  const samples = Object.fromEntries(CASES.map(([k]) => [k, []]));
+  for (let round = 0; round < ROUNDS; round++) {
+    for (const [name] of CASES) {
+      status(`Round ${round + 1} of ${ROUNDS}: ${name}`);
+      for (let w = 0; w < WARMUP; w++) await fns[name]();
+      for (let i = 0; i < SAMPLES; i++) {
+        await q.onSubmittedWorkDone();                 // start from an idle queue
+        const t0 = performance.now();
+        await fns[name]();
+        samples[name].push(performance.now() - t0);
+      }
+    }
+  }
+  device.destroy();
+
+  const info = adapter.info || {};
+  const step = timerStep();
+  const tbody = $('results').querySelector('tbody'); tbody.innerHTML = '';
+  const lines = [];
+  for (const [name, what] of CASES) {
+    const s = stats(samples[name]);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><code>${name}</code></td><td>${what}</td><td class="num">${s.median.toFixed(3)}</td><td class="num">${s.min.toFixed(3)}</td><td class="num">${s.p90.toFixed(3)}</td>`;
+    tbody.appendChild(tr);
+    lines.push(`| ${name} | ${s.median.toFixed(3)} | ${s.min.toFixed(3)} | ${s.p90.toFixed(3)} |`);
+  }
+  $('results').hidden = false;
+  lastReport = [
+    '**WebGPU wait latency test result**',
+    '',
+    `- Browser: ${navigator.userAgent}`,
+    `- Adapter: ${[info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' / ') || '(no adapter info)'}`,
+    `- OS / CPU threads: ${navigator.platform} / ${navigator.hardwareConcurrency}`,
+    `- crossOriginIsolated: ${self.crossOriginIsolated}; performance.now() step: ${step.toFixed(4)} ms`,
+    `- ${SAMPLES} samples x ${ROUNDS} rounds per case, ${WARMUP} warm-up runs; each sample starts from an idle queue`,
+    '',
+    '| Case | Median (ms) | Min (ms) | p90 (ms) |',
+    '|---|---|---|---|',
+    ...lines,
+  ].join('\n');
+  $('report').textContent = lastReport; $('report').hidden = false;
+  $('copy').disabled = false; $('run').disabled = false;
+  $('issue').href = 'https://github.com/LostBeard/webgpu-wait-latency-test/issues/new?title=' + encodeURIComponent('Result: ' + (info.description || info.vendor || 'GPU')) + '&body=' + encodeURIComponent(lastReport);
+  status('Done. Copy the report, or open an issue with it (the link fills it in).');
+  // for automated runs
+  window.__result = { samples, report: lastReport };
+}
+
+$('run').addEventListener('click', run);
+$('copy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(lastReport); $('status').textContent = 'Report copied.'; }
+  catch { $('status').textContent = 'Copy failed: select the report text below instead.'; }
+});
+if (new URLSearchParams(location.search).has('autorun')) run();
+</script>
+</body>
+</html>
