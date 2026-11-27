@@ -2,6 +2,8 @@
 
 **Test your browser: https://lostbeard.github.io/webgpu-wait-latency-test/**
 
+Reported upstream: [Chromium 40286576, comment #6](https://issues.chromium.org/issues/40286576#comment6) (2026-11-26).
+
 In Chrome (and Edge), waiting for a WebGPU submit that contains any work to complete costs about **3 ms** (median), however
 little the work is. A 4 KB copy or a 1,000-thread dispatch that the GPU finishes in microseconds is reported done about 3 ms
 later, whether the page waits with `queue.onSubmittedWorkDone()` or reads the result with `mapAsync()`. The same WebGPU calls
