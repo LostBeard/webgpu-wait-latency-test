@@ -36,6 +36,15 @@ The browser timings are in steps of 0.1 ms (`performance.now()` on a page that i
 wide: in Chrome, C's minimum was 0.2 ms and its 90th percentile 3.8 ms; most samples sit near 3 ms. Firefox (its own WebGPU
 implementation) is not measured yet: results welcome.
 
+## Known upstream
+
+This is a long-known Chromium issue, still open: [Chromium 40286576](https://issues.chromium.org/issues/40286576),
+"Accelerate and decrease latency of GPU->CPU readbacks" (P1). Its 2022 predecessor,
+[Chromium 42240322](https://issues.chromium.org/issues/42240322) "mapAsync API is very slow" (about 3 ms per `await mapAsync`,
+closed as a duplicate of 40286576), traced the cause: Chrome's GPU process checks whether submitted work finished on delayed
+tasks (nominally 1 to 2 ms apart, 4 to 7 ms measured) instead of being woken when the GPU finishes. This repository adds a
+current measurement (Chrome 159, 2026), the comparison with Dawn outside the browser, and a page anyone can run.
+
 ## What each case does
 
 | Case | Submitted and awaited |
